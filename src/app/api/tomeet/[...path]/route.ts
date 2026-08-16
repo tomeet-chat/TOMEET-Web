@@ -15,6 +15,10 @@ function isAllowedRoute(method: string, path: string[]) {
   if (method === "POST") {
     return (
       (path.length === 2 && path[0] === "agent" && path[1] === "messages") ||
+      (path.length === 3 &&
+        path[0] === "agent" &&
+        path[1] === "messages" &&
+        path[2] === "stream") ||
       (path.length === 2 &&
         path[0] === "agent" &&
         path[1] === "multimodal-inputs") ||
@@ -89,6 +93,16 @@ function isWechatSessionEvents(method: string, path: string[]) {
   );
 }
 
+function isAgentStreamRoute(method: string, path: string[]) {
+  return (
+    method === "POST" &&
+    path.length === 3 &&
+    path[0] === "agent" &&
+    path[1] === "messages" &&
+    path[2] === "stream"
+  );
+}
+
 function jsonError(status: number, error: string, message: string) {
   return Response.json(
     { error, message },
@@ -110,6 +124,7 @@ async function proxyToTomeet(
 
   const isWechatConnect = isWechatConnectRoute(path);
   const isWechatEvents = isWechatSessionEvents(request.method, path);
+  const isAgentStream = isAgentStreamRoute(request.method, path);
   if (isWechatConnect && !QR_SERVICE_ENABLED) {
     return jsonError(
       503,
@@ -154,7 +169,7 @@ async function proxyToTomeet(
   apiBaseUrl.hash = "";
   const upstreamUrl = apiBaseUrl;
   const upstreamHeaders = new Headers({
-    Accept: isWechatEvents ? "text/event-stream" : "application/json",
+    Accept: isWechatEvents || isAgentStream ? "text/event-stream" : "application/json",
   });
   if (authorization) upstreamHeaders.set("Authorization", authorization);
   if (isWechatConnect) {
@@ -182,14 +197,14 @@ async function proxyToTomeet(
       body,
       cache: "no-store",
       redirect: "manual",
-      signal: isWechatEvents
+      signal: isWechatEvents || isAgentStream
         ? request.signal
         : AbortSignal.timeout(
             isWechatConnect && request.method === "GET" ? 65_000 : 30_000
           ),
     });
     const responseHeaders = new Headers({
-      "Cache-Control": isWechatEvents
+      "Cache-Control": isWechatEvents || isAgentStream
         ? "no-cache, no-store, no-transform"
         : "no-store",
       "Content-Type":
@@ -202,7 +217,7 @@ async function proxyToTomeet(
       responseHeaders.set("x-request-id", upstreamRequestId);
     }
     if (retryAfter) responseHeaders.set("retry-after", retryAfter);
-    if (isWechatEvents) responseHeaders.set("x-accel-buffering", "no");
+    if (isWechatEvents || isAgentStream) responseHeaders.set("x-accel-buffering", "no");
 
     if (
       upstreamResponse.ok &&

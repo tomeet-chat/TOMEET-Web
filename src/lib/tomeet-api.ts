@@ -41,6 +41,21 @@ export type AgentMessage = {
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  replyToMessageId?: string | null;
+};
+
+export type AgentStreamResult = {
+  userMessage: AgentMessage;
+  message: AgentMessage | null;
+  actions: Record<string, unknown>[];
+  fallbackJobId?: string;
+};
+
+export type AgentStreamHandlers = {
+  onStart?: (event: { userMessage: AgentMessage }) => void;
+  onDelta?: (event: { text: string }) => void;
+  onDone?: (event: AgentStreamResult) => void;
+  onError?: (event: { message: string; jobId?: string | null }) => void;
 };
 
 export type ApiErrorBody = {
@@ -137,19 +152,121 @@ export function getAgentMessages(userId: string, signal?: AbortSignal) {
   );
 }
 
-export function sendAgentMessage(input: {
-  userId: string;
-  displayName: string;
-  content: string;
-  idempotencyKey: string;
-}) {
-  return tomeetApi<{ userMessage: AgentMessage; job: LlmJob }>(
-    "/agent/messages",
-    {
-      method: "POST",
-      body: JSON.stringify(input),
+export async function streamAgentMessage(
+  input: {
+    userId: string;
+    displayName: string;
+    content: string;
+    idempotencyKey: string;
+  },
+  handlers: AgentStreamHandlers = {},
+  signal?: AbortSignal
+): Promise<AgentStreamResult> {
+  const accessToken = await getAccessToken();
+  const response = await fetch(`${API_BASE_URL}/agent/messages/stream`, {
+    method: "POST",
+    cache: "no-store",
+    headers: {
+      Accept: "text/event-stream",
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(input),
+    signal,
+  });
+
+  if (!response.ok) {
+    const body = (await response.json().catch(() => ({}))) as Partial<ApiErrorBody>;
+    throw new TomeetApiError(response.status, {
+      error: body.error || "REQUEST_FAILED",
+      message: body.message || `TOMEET API request failed: ${response.status}`,
+      requestId: body.requestId,
+      details: body.details,
+    });
+  }
+
+  if (!response.body) throw new TomeetJobError("The Agent stream was empty.");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let startedMessage: AgentMessage | undefined;
+  let completed: AgentStreamResult | undefined;
+  let streamError: { message: string; jobId?: string | null } | undefined;
+
+  const dispatch = (block: string) => {
+    const lines = block.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    let eventName = "message";
+    const dataLines: string[] = [];
+    for (const line of lines) {
+      if (line.startsWith("event:")) eventName = line.slice("event:".length).trim();
+      if (line.startsWith("data:")) dataLines.push(line.slice("data:".length).trimStart());
     }
-  );
+    if (dataLines.length === 0) return;
+
+    const data = JSON.parse(dataLines.join("\n")) as Record<string, unknown>;
+    if (eventName === "start") {
+      const userMessage = data.userMessage as AgentMessage;
+      startedMessage = userMessage;
+      handlers.onStart?.({ userMessage });
+    } else if (eventName === "delta" && typeof data.text === "string") {
+      handlers.onDelta?.({ text: data.text });
+    } else if (eventName === "done") {
+      completed = {
+        userMessage: data.userMessage as AgentMessage,
+        message: (data.message as AgentMessage | null | undefined) ?? null,
+        actions: Array.isArray(data.actions)
+          ? data.actions.filter(
+              (action): action is Record<string, unknown> =>
+                Boolean(action) && typeof action === "object"
+            )
+          : [],
+      };
+      handlers.onDone?.(completed);
+    } else if (eventName === "error") {
+      streamError = {
+        message: typeof data.message === "string" ? data.message : "Agent stream failed.",
+        jobId: typeof data.jobId === "string" ? data.jobId : null,
+      };
+      handlers.onError?.(streamError);
+    }
+  };
+
+  const consume = (chunk: string) => {
+    buffer += chunk.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    let separator = buffer.indexOf("\n\n");
+    while (separator >= 0) {
+      const block = buffer.slice(0, separator);
+      buffer = buffer.slice(separator + 2);
+      dispatch(block);
+      separator = buffer.indexOf("\n\n");
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    consume(decoder.decode(value, { stream: true }));
+  }
+  consume(decoder.decode());
+  if (buffer.trim()) dispatch(buffer);
+
+  if (completed) return completed;
+  if (streamError?.jobId) {
+    const { job } = await tomeetApi<{ job: LlmJob }>(
+      `/jobs/${encodeURIComponent(streamError.jobId)}`,
+      { signal }
+    );
+    await waitForJob(job, { signal });
+    return {
+      userMessage: startedMessage ?? ({} as AgentMessage),
+      message: null,
+      actions: [],
+      fallbackJobId: streamError.jobId,
+    };
+  }
+  if (streamError) throw new TomeetJobError(streamError.message);
+  throw new TomeetJobError("The Agent stream ended before completion.");
 }
 
 export function signImageUpload(input: {
