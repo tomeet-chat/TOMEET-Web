@@ -301,15 +301,19 @@ export async function streamAgentMessage(
   throw new TomeetJobError("The Agent stream ended before completion.");
 }
 
-export function signImageUpload(input: {
-  userId: string;
-  fileName: string;
-  mimeType: "image/jpeg" | "image/png" | "image/webp";
-  sizeBytes: number;
-}) {
+export function signImageUpload(
+  input: {
+    userId: string;
+    fileName: string;
+    mimeType: "image/jpeg" | "image/png" | "image/webp";
+    sizeBytes: number;
+  },
+  signal?: AbortSignal
+) {
   return tomeetApi<SignedUpload>("/uploads/sign", {
     method: "POST",
     body: JSON.stringify(input),
+    signal,
   });
 }
 
@@ -326,13 +330,16 @@ export async function uploadSignedImage(
   if (error) throw error;
 }
 
-export function registerImageInput(input: {
-  userId: string;
-  storagePath: string;
-  mimeType: "image/jpeg" | "image/png" | "image/webp";
-  sizeBytes: number;
-  hint?: string;
-}) {
+export function registerImageInput(
+  input: {
+    userId: string;
+    storagePath: string;
+    mimeType: "image/jpeg" | "image/png" | "image/webp";
+    sizeBytes: number;
+    hint?: string;
+  },
+  signal?: AbortSignal
+) {
   return tomeetApi<{ inputId: string; job: LlmJob }>(
     "/agent/multimodal-inputs",
     {
@@ -341,6 +348,7 @@ export function registerImageInput(input: {
         ...input,
         kind: "image",
       }),
+      signal,
     }
   );
 }
@@ -376,9 +384,13 @@ export async function waitForJob(
   }
 
   const deadline = Date.now() + (options.timeoutMs ?? 60_000);
+  let pollDelayMs = 1_000;
 
   while (Date.now() < deadline) {
-    await abortableDelay(1_500, options.signal);
+    const remainingMs = deadline - Date.now();
+    await abortableDelay(Math.min(pollDelayMs, remainingMs), options.signal);
+    if (Date.now() >= deadline) break;
+
     const { job: currentJob } = await tomeetApi<{ job: LlmJob }>(
       `/jobs/${encodeURIComponent(job.id)}`,
       { signal: options.signal }
@@ -390,6 +402,7 @@ export async function waitForJob(
         currentJob.error || "The Agent could not finish this request."
       );
     }
+    pollDelayMs = Math.min(pollDelayMs * 2, 5_000);
   }
 
   throw new TomeetJobTimeoutError();
