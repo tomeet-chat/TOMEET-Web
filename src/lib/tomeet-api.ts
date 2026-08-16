@@ -94,6 +94,27 @@ export class TomeetJobError extends Error {
   }
 }
 
+function isAgentMessage(value: unknown): value is AgentMessage {
+  if (!value || typeof value !== "object") return false;
+  const message = value as Partial<AgentMessage>;
+  return (
+    typeof message.id === "string" &&
+    typeof message.userId === "string" &&
+    (message.role === "user" || message.role === "assistant") &&
+    typeof message.content === "string" &&
+    typeof message.createdAt === "string"
+  );
+}
+
+function recordArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter(
+        (item): item is Record<string, unknown> =>
+          Boolean(item) && typeof item === "object"
+      )
+    : [];
+}
+
 let browserClient: ReturnType<typeof createClient> | undefined;
 
 function getSupabase() {
@@ -215,12 +236,7 @@ export async function streamAgentMessage(
       completed = {
         userMessage: data.userMessage as AgentMessage,
         message: (data.message as AgentMessage | null | undefined) ?? null,
-        actions: Array.isArray(data.actions)
-          ? data.actions.filter(
-              (action): action is Record<string, unknown> =>
-                Boolean(action) && typeof action === "object"
-            )
-          : [],
+        actions: recordArray(data.actions),
       };
       handlers.onDone?.(completed);
     } else if (eventName === "error") {
@@ -257,13 +273,29 @@ export async function streamAgentMessage(
       `/jobs/${encodeURIComponent(streamError.jobId)}`,
       { signal }
     );
-    await waitForJob(job, { signal });
-    return {
-      userMessage: startedMessage ?? ({} as AgentMessage),
-      message: null,
-      actions: [],
+    const finishedJob = await waitForJob(job, { signal });
+    if (!startedMessage) {
+      throw new TomeetJobError("The Agent stream did not identify the saved message.");
+    }
+    let message = isAgentMessage(finishedJob.result?.message)
+      ? finishedJob.result.message
+      : null;
+    if (!message) {
+      const history = await getAgentMessages(input.userId, signal);
+      message = history.messages.find(
+        (item) =>
+          item.role === "assistant" &&
+          item.replyToMessageId === startedMessage?.id
+      ) ?? null;
+    }
+    const fallbackResult: AgentStreamResult = {
+      userMessage: startedMessage,
+      message,
+      actions: recordArray(finishedJob.result?.actions),
       fallbackJobId: streamError.jobId,
     };
+    handlers.onDone?.(fallbackResult);
+    return fallbackResult;
   }
   if (streamError) throw new TomeetJobError(streamError.message);
   throw new TomeetJobError("The Agent stream ended before completion.");
