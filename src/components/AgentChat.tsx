@@ -335,9 +335,16 @@ export default function AgentChat({ viewer }: { viewer: AuthViewer }) {
               });
             },
             onDone: ({ message }) => {
-              if (!message || !mountedRef.current) return;
+              if (!message) return;
+              serverMessageIdsRef.current.add(message.id);
+              if (!mountedRef.current) return;
               const finalMessage = toChatMessage(message);
               setMessages((current) => {
+                if (current.some((item) => item.id === finalMessage.id)) {
+                  return current.map((item) =>
+                    item.id === finalMessage.id ? finalMessage : item
+                  );
+                }
                 if (streamedAssistantId) {
                   return current.map((item) =>
                     item.id === streamedAssistantId ? finalMessage : item
