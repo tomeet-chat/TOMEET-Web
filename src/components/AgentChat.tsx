@@ -19,8 +19,8 @@ import type { AuthViewer } from "@/lib/auth";
 import {
   getAgentMessages,
   registerImageInput,
-  sendAgentMessage,
   signImageUpload,
+  streamAgentMessage,
   TomeetApiError,
   TomeetJobError,
   TomeetJobTimeoutError,
@@ -46,7 +46,7 @@ type PhotoAttachment = {
   url: string;
 };
 
-type Activity = "loading" | "uploading" | "thinking" | null;
+type Activity = "loading" | "uploading" | "thinking" | "streaming" | null;
 
 const IMAGE_MARKER = "[发送了一张图片]";
 const AUDIO_MARKER = "[发送了一段录音]";
@@ -247,6 +247,7 @@ export default function AgentChat({ viewer }: { viewer: AuthViewer }) {
         ? retryTextRef.current.idempotencyKey
         : crypto.randomUUID();
     let acceptedByBackend = false;
+    let streamedAssistantId: string | null = null;
 
     setErrorMessage(null);
     setMessages((current) => [
@@ -290,20 +291,63 @@ export default function AgentChat({ viewer }: { viewer: AuthViewer }) {
         await finishJob(job);
       } else {
         setActivity("thinking");
-        const { userMessage, job } = await sendAgentMessage({
-          userId: viewer.id,
-          displayName: viewer.label.trim().slice(0, 80) || t("you"),
-          content: text,
-          idempotencyKey: textIdempotencyKey!,
-        });
-        acceptedByBackend = true;
-        serverMessageIdsRef.current.add(userMessage.id);
-        setMessages((current) =>
-          current.map((message) =>
-            message.id === optimisticId ? toChatMessage(userMessage) : message
-          )
+        await streamAgentMessage(
+          {
+            userId: viewer.id,
+            displayName: viewer.label.trim().slice(0, 80) || t("you"),
+            content: text,
+            idempotencyKey: textIdempotencyKey!,
+          },
+          {
+            onStart: ({ userMessage }) => {
+              acceptedByBackend = true;
+              serverMessageIdsRef.current.add(userMessage.id);
+              setMessages((current) =>
+                current.map((message) =>
+                  message.id === optimisticId ? toChatMessage(userMessage) : message
+                )
+              );
+            },
+            onDelta: ({ text: delta }) => {
+              if (!mountedRef.current) return;
+              streamedAssistantId ??= `stream-${crypto.randomUUID()}`;
+              const assistantId = streamedAssistantId;
+              setActivity("streaming");
+              setMessages((current) => {
+                const existing = current.find(
+                  (message) => message.id === assistantId
+                );
+                if (existing) {
+                  return current.map((message) =>
+                    message.id === assistantId
+                      ? { ...message, text: message.text + delta, pending: false }
+                      : message
+                  );
+                }
+                return [
+                  ...current,
+                  {
+                    id: assistantId,
+                    role: "agent",
+                    text: delta,
+                  },
+                ];
+              });
+            },
+            onDone: ({ message }) => {
+              if (!message || !mountedRef.current) return;
+              const finalMessage = toChatMessage(message);
+              setMessages((current) => {
+                if (streamedAssistantId) {
+                  return current.map((item) =>
+                    item.id === streamedAssistantId ? finalMessage : item
+                  );
+                }
+                return [...current, finalMessage];
+              });
+            },
+          }
         );
-        await finishJob(job);
       }
 
       await reconcileMessages();
