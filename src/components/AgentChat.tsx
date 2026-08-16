@@ -87,6 +87,7 @@ export default function AgentChat({ viewer }: { viewer: AuthViewer }) {
   const retryTextRef = useRef<{ content: string; idempotencyKey: string } | null>(
     null
   );
+  const activeSendControllerRef = useRef<AbortController | null>(null);
   const mountedRef = useRef(true);
 
   const profileHref = localizedHref(locale, "/profile");
@@ -191,6 +192,8 @@ export default function AgentChat({ viewer }: { viewer: AuthViewer }) {
 
     return () => {
       mountedRef.current = false;
+      activeSendControllerRef.current?.abort();
+      activeSendControllerRef.current = null;
       objectUrls.forEach((url) => URL.revokeObjectURL(url));
     };
   }, []);
@@ -225,20 +228,27 @@ export default function AgentChat({ viewer }: { viewer: AuthViewer }) {
     });
   }, [activity, hasStarted, messages]);
 
-  async function finishJob(job: LlmJob) {
-    if (job.status !== "completed") await waitForJob(job);
+  async function finishJob(job: LlmJob, signal: AbortSignal) {
+    if (job.status !== "completed") await waitForJob(job, { signal });
   }
 
   async function sendMessage() {
     const text = draft.trim();
     const currentAttachment = attachment;
-    if ((!text && !currentAttachment) || isInteractionDisabled) return;
+    if (
+      (!text && !currentAttachment) ||
+      isInteractionDisabled ||
+      activeSendControllerRef.current
+    ) return;
 
     if (currentAttachment && text.length > 2_000) {
       setErrorMessage(t("photoHintTooLong"));
       return;
     }
 
+    const requestController = new AbortController();
+    const { signal } = requestController;
+    activeSendControllerRef.current = requestController;
     const beforeIds = new Set(serverMessageIdsRef.current);
     const optimisticId = `local-${crypto.randomUUID()}`;
     const textIdempotencyKey = currentAttachment
@@ -267,28 +277,34 @@ export default function AgentChat({ viewer }: { viewer: AuthViewer }) {
     try {
       if (currentAttachment) {
         setActivity("uploading");
-        const signedUpload = await signImageUpload({
-          userId: viewer.id,
-          fileName: currentAttachment.name,
-          mimeType: currentAttachment.mimeType,
-          sizeBytes: currentAttachment.file.size,
-        });
+        const signedUpload = await signImageUpload(
+          {
+            userId: viewer.id,
+            fileName: currentAttachment.name,
+            mimeType: currentAttachment.mimeType,
+            sizeBytes: currentAttachment.file.size,
+          },
+          signal
+        );
         await uploadSignedImage(signedUpload, currentAttachment.file);
 
         setActivity("thinking");
-        const { job } = await registerImageInput({
-          userId: viewer.id,
-          storagePath: signedUpload.path,
-          mimeType: currentAttachment.mimeType,
-          sizeBytes: currentAttachment.file.size,
-          hint: text || undefined,
-        });
+        const { job } = await registerImageInput(
+          {
+            userId: viewer.id,
+            storagePath: signedUpload.path,
+            mimeType: currentAttachment.mimeType,
+            sizeBytes: currentAttachment.file.size,
+            hint: text || undefined,
+          },
+          signal
+        );
         acceptedByBackend = true;
-        await reconcileMessages(undefined, {
+        await reconcileMessages(signal, {
           beforeIds,
           url: currentAttachment.url,
         });
-        await finishJob(job);
+        await finishJob(job, signal);
       } else {
         setActivity("thinking");
         await streamAgentMessage(
@@ -353,16 +369,17 @@ export default function AgentChat({ viewer }: { viewer: AuthViewer }) {
                 return [...current, finalMessage];
               });
             },
-          }
+          },
+          signal
         );
       }
 
-      await reconcileMessages();
+      await reconcileMessages(signal);
     } catch (error: unknown) {
       let history: AgentMessage[] = [];
       try {
         history = await reconcileMessages(
-          undefined,
+          signal,
           currentAttachment
             ? { beforeIds, url: currentAttachment.url }
             : undefined
@@ -389,6 +406,9 @@ export default function AgentChat({ viewer }: { viewer: AuthViewer }) {
       }
       if (mountedRef.current) setErrorMessage(getDisplayError(error));
     } finally {
+      if (activeSendControllerRef.current === requestController) {
+        activeSendControllerRef.current = null;
+      }
       if (acceptedByBackend && !currentAttachment) retryTextRef.current = null;
       if (mountedRef.current) setActivity(null);
     }
